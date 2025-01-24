@@ -1,33 +1,33 @@
-# hw-watch
+# watchman
 
-**`hw-watch`** is a lightweight debugging tool that uses **hardware watchpoints** to monitor memory writes in running processes. It attaches to a live process, sets up to 4 watchpoints using the `ptrace` API (DR0–DR3 on x86), and triggers symbolic stack traces in the target process when a watchpoint is hit. The tool leverages **libbacktrace** for symbolic decoding of instruction pointers.
+**`watchman`** is a lightweight debugging tool that uses **hardware watchpoints** to monitor memory writes in running processes. It attaches to a live process, sets up to 4 watchpoints using the `ptrace` API (DR0–DR3 on x86), and triggers symbolic stack traces in the target process when a watchpoint is hit. The tool leverages **libbacktrace** for symbolic decoding of instruction pointers.
 
 ---
 
 ## Features
 
-- **Hardware watchpoints**: Set up to 4 simultaneous watchpoints (DR0–DR3) to monitor specific memory addresses.
-- **Signal-based communication**: Sends custom signals (e.g., `SIGUSR2`) to the target process to trigger local stack traces.
-- **In-process stack traces**: The target process itself uses `libbacktrace` to decode its stack, providing precise file names and line numbers.
-- **Simple integration**: Includes a test program (`multi_watch_test`) to demonstrate hardware watchpoints in action.
+- **Hardware watchpoints**: Monitor up to 4 memory locations simultaneously using debug registers (DR0–DR3).  
+- **Signal-based communication**: Sends `SIGUSR2` to the target process when a watchpoint is triggered.  
+- **In-process stack traces**: The target process uses `libbacktrace` to print a stack trace, including file names and line numbers.  
+- **Easy integration**: Includes example programs to demonstrate setting up watchpoints and monitoring memory writes.
 
 ---
 
 ## Components
 
-- **`multi_watch_test`**: A test program that modifies multiple global variables. The debugger attaches to this process and monitors memory writes.  
-- **`watch_debugger`**: The external debugger that attaches to a running process, sets watchpoints, and signals the target process when a watchpoint is triggered.
+- **`multi_watch_test`**: A sample program that modifies multiple global variables in a loop. The debugger attaches to this program and monitors memory writes.  
+- **`watchman`**: The external debugger that attaches to a running process, sets watchpoints, and signals the target process when a watchpoint is triggered.
 
 ---
 
 ## How It Works
 
-1. **Attach** the debugger to a running process using `ptrace`.
-2. **Set watchpoints** for specific memory addresses (e.g., `g_varA`, `g_varB`).
+1. The **debugger** attaches to a running process using `ptrace`.  
+2. It sets hardware watchpoints for specific memory addresses.  
 3. When a watchpoint is triggered:
-   - The debugger detects the event via `ptrace` and injects a `SIGUSR2` signal into the target.
-   - The target handles `SIGUSR2` and generates a **local stack trace** using `libbacktrace`.
-4. Execution continues seamlessly after the watchpoint.
+   - The debugger detects the event via `ptrace` and injects a `SIGUSR2` signal into the target.  
+   - The target’s custom `SIGUSR2` handler generates a **local stack trace** using `libbacktrace`.  
+4. The target process resumes execution after handling the signal.
 
 ---
 
@@ -44,6 +44,6 @@
 Clone the repository and build the project using `make`:
 
 ```bash
-git clone https://github.com/yourusername/hw-watch.git
-cd hw-watch
+git clone https://github.com/yourusername/watchman.git
+cd watchman
 make
