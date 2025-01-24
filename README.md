@@ -7,7 +7,7 @@
 ## Features
 
 - **Hardware watchpoints**: Set up to 4 simultaneous watchpoints (DR0–DR3) to monitor specific memory addresses.
-- **Signal-based communication**: Sends custom signals (e.g., `SIGUSR1`) to the target process to trigger local stack traces.
+- **Signal-based communication**: Sends custom signals (e.g., `SIGUSR2`) to the target process to trigger local stack traces.
 - **In-process stack traces**: The target process itself uses `libbacktrace` to decode its stack, providing precise file names and line numbers.
 - **Simple integration**: Includes a test program (`multi_watch_test`) to demonstrate hardware watchpoints in action.
 
@@ -25,8 +25,8 @@
 1. **Attach** the debugger to a running process using `ptrace`.
 2. **Set watchpoints** for specific memory addresses (e.g., `g_varA`, `g_varB`).
 3. When a watchpoint is triggered:
-   - The debugger detects the event via `ptrace` and injects a `SIGUSR1` signal into the target.
-   - The target handles `SIGUSR1` and generates a **local stack trace** using `libbacktrace`.
+   - The debugger detects the event via `ptrace` and injects a `SIGUSR2` signal into the target.
+   - The target handles `SIGUSR2` and generates a **local stack trace** using `libbacktrace`.
 4. Execution continues seamlessly after the watchpoint.
 
 ---
