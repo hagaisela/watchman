@@ -12,307 +12,259 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <signal.h>
+#include <linux/ptrace.h>  // For PTRACE_EVENT definitions
 
 #define MAX_WATCHPOINTS 4
+#define MAX_THREADS 1024
 
 typedef struct {
     uintptr_t addr;
     size_t size;
-} watch_t;
+} watchpoint_t;
 
-static watch_t g_watches[MAX_WATCHPOINTS];
-static int g_num_watches = 0;
-static pid_t g_target_pid = 0;
+watchpoint_t watchpoints[MAX_WATCHPOINTS];
+int num_watchpoints = 0;
 
-// ctrl+c flags
-static volatile int g_stop_requested = 0;
-static volatile int g_already_detaching = 0; // so we ignore subsequent Ctrl+C
+pid_t thread_ids[MAX_THREADS];
+int num_threads = 0;
 
-static void sigint_handler(int signo) {
-    (void)signo;
-    // If we're already detaching, ignore further Ctrl+C
-    if (g_already_detaching) {
-        fprintf(stderr, "[watchman] (Ctrl+C again) ignoring while detaching...\n");
-        return;
-    }
-    g_stop_requested = 1;
-}
+#ifdef __x86_64__
+#define DEBUGREG_OFFSET(n)  (8 * (n))
+#else
+#define DEBUGREG_OFFSET(n)  (4 * (n))
+#endif
 
-static void ignore_subsequent_ctrl_c(void) {
-    // we set g_already_detaching so further SIGINT does nothing
-    g_already_detaching = 1;
-}
-
-// DR7: write-only
-static unsigned long dr7_rw_bits(void) {
-    return 0b01UL;
-}
-
-// length => 1=>0b00,2=>0b01,4=>0b11,8=>0b10
-static unsigned long dr7_length_bits(size_t length) {
-    switch(length) {
-    case 1: return 0b00UL;
-    case 2: return 0b01UL;
-    case 4: return 0b11UL;
-    case 8: return 0b10UL;
-    default:
-        fprintf(stderr, "[watchman] forcing length=4 for %zu\n", length);
-        return 0b11UL;
-    }
-}
-
-static int attach_thread(pid_t tid) {
-    if (ptrace(PTRACE_ATTACH, tid, NULL, NULL)==-1) {
-        fprintf(stderr, "[watchman] TID=%d PTRACE_ATTACH fail: %s\n",
-                tid, strerror(errno));
+static int set_watchpoint(pid_t tid, int which, uintptr_t addr, size_t length) {
+    // Validate which debug register to use (0-3)
+    if (which < 0 || which > 3) {
+        fprintf(stderr, "[watchman] Invalid debug register: DR%d\n", which);
         return -1;
     }
-    int st;
-    if (waitpid(tid, &st, __WALL)==-1) {
+
+    // Set the address in DRx
+    unsigned long offset = offsetof(struct user, u_debugreg[which]);
+    if (ptrace(PTRACE_POKEUSER, tid, (void*)offset, (void*)addr) == -1) {
+        fprintf(stderr, "[watchman] TID=%d: Failed to set DR%d to 0x%lx: %s\n",
+                tid, which, addr, strerror(errno));
+        return -1;
+    }
+
+    // Read current DR7
+    errno = 0;
+    offset = offsetof(struct user, u_debugreg[7]);
+    unsigned long dr7 = ptrace(PTRACE_PEEKUSER, tid, (void*)offset, 0);
+    if (dr7 == -1 && errno) {
+        fprintf(stderr, "[watchman] TID=%d: Failed to read DR7: %s\n", tid, strerror(errno));
+        return -1;
+    }
+
+    // Enable the local exact breakpoint enable
+    dr7 |= (1 << (which * 2));  // Local enable for DRx
+
+    unsigned long rw_bits = 0b01;  // Break on write
+    unsigned long len_bits;
+    switch (length) {
+        case 1: len_bits = 0b00; break;
+        case 2: len_bits = 0b01; break;
+        case 4: len_bits = 0b11; break;
+        default:
+            fprintf(stderr, "[watchman] Invalid length %zu. Must be 1, 2, or 4.\n", length);
+            return -1;
+    }
+
+    unsigned long rw_len = (rw_bits << 2) | len_bits;
+
+    // Clear the existing settings for this breakpoint
+    dr7 &= ~((0xF) << (16 + which * 4));
+
+    // Set the new settings
+    dr7 |= (rw_len) << (16 + which * 4);
+
+    // Write back DR7
+    offset = offsetof(struct user, u_debugreg[7]);
+    if (ptrace(PTRACE_POKEUSER, tid, (void*)offset, (void*)dr7) == -1) {
+        fprintf(stderr, "[watchman] TID=%d: Failed to set DR7 to 0x%lx: %s\n",
+                tid, dr7, strerror(errno));
+        return -1;
+    }
+
+    fprintf(stderr, "[watchman] TID=%d: Set watchpoint %d at addr=0x%lx with DR7=0x%lx\n",
+            tid, which, addr, dr7);
+
+    return 0;
+}
+
+int attach_thread(pid_t tid) {
+    fprintf(stderr, "[watchman] Trying to attach to TID=%d\n", tid);
+    if (ptrace(PTRACE_ATTACH, tid, NULL, NULL) == -1) {
+        fprintf(stderr, "[watchman] TID=%d PTRACE_ATTACH fail: %s\n", tid, strerror(errno));
+        return -1;
+    }
+
+    int status;
+    if (waitpid(tid, &status, __WALL) == -1) {
         fprintf(stderr, "[watchman] waitpid(%d) fail: %s\n", tid, strerror(errno));
         return -1;
     }
+    fprintf(stderr, "[watchman] TID=%d stopped, status=0x%x\n", tid, status);
+
+    if (ptrace(PTRACE_SETOPTIONS, tid, NULL, PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT) == -1) {
+        fprintf(stderr, "[watchman] TID=%d PTRACE_SETOPTIONS fail: %s\n", tid, strerror(errno));
+        return -1;
+    }
+    fprintf(stderr, "[watchman] TID=%d options set\n", tid);
+
+    // Set all watchpoints for this thread
+    for (int i = 0; i < num_watchpoints; i++) {
+        if (set_watchpoint(tid, i, watchpoints[i].addr, watchpoints[i].size) == -1) {
+            fprintf(stderr, "[watchman] TID=%d Failed to set watchpoint %d\n", tid, i);
+            return -1;
+        }
+    }
+
+    if (ptrace(PTRACE_CONT, tid, NULL, NULL) == -1) {
+        fprintf(stderr, "[watchman] TID=%d PTRACE_CONT fail: %s\n", tid, strerror(errno));
+    } else {
+        fprintf(stderr, "[watchman] TID=%d continued\n", tid);
+    }
+
     return 0;
 }
 
-static int set_watchpoint(pid_t tid, int which, uintptr_t addr, size_t length) {
-    off_t off = offsetof(struct user, u_debugreg[0]) + which*sizeof(long);
-    if (ptrace(PTRACE_POKEUSER, tid, (void*)off, (void*)addr)==-1) {
-        fprintf(stderr,"[watchman] TID=%d: poke DR%d fail:%s\n", tid, which, strerror(errno));
+int attach_all_threads(pid_t pid) {
+    char tasks_path[256];
+    snprintf(tasks_path, sizeof(tasks_path), "/proc/%d/task", pid);
+
+    DIR *dir = opendir(tasks_path);
+    if (!dir) {
+        perror("opendir");
         return -1;
     }
 
-    long dr7 = ptrace(PTRACE_PEEKUSER, tid,(void*)offsetof(struct user, u_debugreg[7]),0);
-    if (dr7==-1 && errno) {
-        fprintf(stderr,"[watchman] TID=%d: peek DR7 fail:%s\n", tid, strerror(errno));
-        return -1;
-    }
-    // local enable => bit(2*which)
-    dr7 |= (1UL<<(2*which));
-
-    unsigned long rw = dr7_rw_bits();
-    unsigned long ln = dr7_length_bits(length);
-    unsigned long combined = ((rw<<2)| ln) & 0xF;
-
-    unsigned long shift = 16 + which*4;
-    unsigned long mask = 0xFUL << shift;
-    dr7 &= ~mask;
-    dr7 |= (combined<<shift);
-
-    if (ptrace(PTRACE_POKEUSER, tid,(void*)offsetof(struct user,u_debugreg[7]),
-               (void*)dr7)==-1) {
-        fprintf(stderr,"[watchman] TID=%d: poke DR7 fail:%s\n", tid, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-
-// flush leftover watchpoint traps by single-stepping
-// up to e.g. 5 times
-static void flush_thread(pid_t tid) {
-    // Clear DR7 => no watchpoints
-    ptrace(PTRACE_POKEUSER, tid,(void*)offsetof(struct user,u_debugreg[7]),
-           (void*)0);
-
-    // Also clear DR0..DR3
-    for (int i=0; i<4; i++) {
-        off_t off = offsetof(struct user,u_debugreg[0]) + i*sizeof(long);
-        ptrace(PTRACE_POKEUSER, tid, (void*)off, (void*)0);
-    }
-
-    // We'll do up to 5 single-steps or until we see no watch_bits
-    for (int step=0; step<5; step++) {
-        if (ptrace(PTRACE_SINGLESTEP, tid, NULL, 0)==-1) {
-            fprintf(stderr,"[watchman] TID=%d: SINGLESTEP fail:%s\n", tid, strerror(errno));
-            return;
-        }
-        int st;
-        waitpid(tid, &st, __WALL);
-
-        if (!WIFSTOPPED(st)) {
-            // The thread might have exited?
-            return;
-        }
-        if (WSTOPSIG(st) != SIGTRAP) {
-            // no trap => leftover signal
+    struct dirent *entry;
+    num_threads = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.')
             continue;
+        pid_t tid = atoi(entry->d_name);
+        if (attach_thread(tid) == -1) {
+            fprintf(stderr, "[watchman] Failed to attach to TID=%d\n", tid);
+            closedir(dir);
+            return -1;
         }
-        // check DR6
-        long dr6 = ptrace(PTRACE_PEEKUSER, tid,
-                          (void*)offsetof(struct user,u_debugreg[6]),
-                          0);
-        int watch_bits = dr6 & 0xF;
-        // clear DR6
-        ptrace(PTRACE_POKEUSER, tid,
-               (void*)offsetof(struct user,u_debugreg[6]),
-               (void*)0);
-
-        if (!watch_bits) {
-            // no hardware watchpoint triggered => we might be safe
-            // but we do all 5 steps or break early. Let's break early:
-            break;
-        }
-        // if watch_bits != 0 => watchpoint triggered again
-        // but we already set DR7=0, so it might be a leftover queued trap
-        // keep single-stepping
+        thread_ids[num_threads++] = tid;
     }
+    closedir(dir);
+    return 0;
 }
 
-// final detach for one TID
-static void detach_thread(pid_t tid) {
-    // do PTRACE_DETACH
-    if (ptrace(PTRACE_DETACH, tid, NULL, NULL)==-1) {
-        fprintf(stderr,"[watchman] TID=%d: DETACH fail:%s\n", tid, strerror(errno));
-    } else {
-        fprintf(stderr,"[watchman] Detached TID=%d\n", tid);
-    }
-}
+void handle_trace_event(pid_t tid, int status) {
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "[watchman] TID=%d exited\n", tid);
+    } else if (WIFSTOPPED(status)) {
+        int sig = WSTOPSIG(status);
+        if (sig == SIGTRAP) {
+            siginfo_t siginfo;
+            if (ptrace(PTRACE_GETSIGINFO, tid, NULL, &siginfo) == -1) {
+                fprintf(stderr, "[watchman] TID=%d PTRACE_GETSIGINFO fail: %s\n", tid, strerror(errno));
+                return;
+            }
 
-// main function for final detach
-// 1) send SIGSTOP => fully freeze the process
-// 2) interrupt each TID => flush => detach
-// 3) optional SIGCONT
-static void flush_and_detach_all_threads(pid_t pid, int do_sigcont_after) {
-    // Freeze entire process
-    kill(pid, SIGSTOP);
+            if (siginfo.si_code == TRAP_HWBKPT) {
+                fprintf(stderr, "[watchman] TID=%d: Watchpoint hit at address 0x%lx\n", tid, (unsigned long)siginfo.si_addr);
 
-    // Wait for main thread to stop
-    int st;
-    if (waitpid(pid, &st, WUNTRACED)==-1) {
-        fprintf(stderr,"[watchman] waitpid(%d) fail:%s\n", pid, strerror(errno));
-        // continue anyway
-    } else {
-        if (WIFSTOPPED(st)) {
-            fprintf(stderr,"[watchman] pid=%d is SIGSTOPped.\n", pid);
+                // Send SIGUSR2 to the traced process
+                if (ptrace(PTRACE_CONT, tid, NULL, (void *)(long)SIGUSR2) == -1) {
+                    fprintf(stderr, "[watchman] TID=%d PTRACE_CONT with SIGUSR2 fail: %s\n", tid, strerror(errno));
+                }
+            } else {
+                // Handle other SIGTRAP cases
+                if (ptrace(PTRACE_CONT, tid, NULL, NULL) == -1) {
+                    fprintf(stderr, "[watchman] TID=%d PTRACE_CONT fail: %s\n", tid, strerror(errno));
+                }
+            }
+        } else {
+            // Forward other signals
+            fprintf(stderr, "[watchman] TID=%d received signal %d (%s)\n", tid, sig, strsignal(sig));
+            if (ptrace(PTRACE_CONT, tid, NULL, (void *)(long)sig) == -1) {
+                fprintf(stderr, "[watchman] TID=%d PTRACE_CONT fail: %s\n", tid, strerror(errno));
+            }
         }
-    }
-
-    // Now enumerate TIDs
-    char dirpath[64];
-    snprintf(dirpath,sizeof(dirpath),"/proc/%d/task", pid);
-
-    DIR* d = opendir(dirpath);
-    if (!d) {
-        fprintf(stderr,"[watchman] cannot open %s:%s\n", dirpath, strerror(errno));
-        return;
-    }
-    struct dirent *de;
-    while ((de = readdir(d))) {
-        if (de->d_name[0]=='.') continue;
-        pid_t tid = atoi(de->d_name);
-        if (!tid) continue;
-
-        // we assume tid was attached since the start => no re-attach
-        // but we do PTRACE_INTERRUPT just in case it's not truly in ptrace-stop
-        if (ptrace(PTRACE_INTERRUPT, tid, NULL, NULL)==0) {
-            int st2;
-            waitpid(tid, &st2, __WALL);
+    } else {
+        fprintf(stderr, "[watchman] TID=%d stopped with unexpected status 0x%x\n", tid, status);
+        // Continue the process
+        if (ptrace(PTRACE_CONT, tid, NULL, NULL) == -1) {
+            fprintf(stderr, "[watchman] TID=%d PTRACE_CONT fail: %s\n", tid, strerror(errno));
         }
-        // flush
-        flush_thread(tid);
-        // detach
-        detach_thread(tid);
-    }
-    closedir(d);
-
-    if (do_sigcont_after) {
-        kill(pid, SIGCONT);
-        fprintf(stderr,"[watchman] Sent SIGCONT pid=%d\n",pid);
     }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc<4) {
-        fprintf(stderr,"Usage:%s <pid> <addr1> <size1> [<addr2> <size2> ...]\n",argv[0]);
+    if (argc < 4 || argc % 2 != 0) {
+        fprintf(stderr, "Usage: %s <pid> <address1> <length1> [<address2> <length2> ...]\n", argv[0]);
         return 1;
     }
-    g_target_pid = atoi(argv[1]);
-    int pairs = (argc-2)/2;
-    if (pairs>MAX_WATCHPOINTS) pairs=MAX_WATCHPOINTS;
 
-    for(int i=0;i<pairs;i++){
-        uintptr_t a = strtoull(argv[2+i*2], NULL, 16);
-        size_t sz = (size_t)strtoull(argv[3+i*2], NULL, 0);
-        g_watches[i].addr = a;
-        g_watches[i].size = sz;
-        g_num_watches++;
-        fprintf(stderr,"[watchman] watch #%d => addr=0x%lx, size=%zu\n", i,(unsigned long)a,sz);
-    }
+    pid_t pid = atoi(argv[1]);
 
-    // install ctrl+c
-    struct sigaction sa;
-    memset(&sa,0,sizeof(sa));
-    sa.sa_handler = sigint_handler;
-    sigaction(SIGINT,&sa,NULL);
-
-    // attach existing TIDs
-    // then we let them run
-    {
-        char dirpath[64];
-        snprintf(dirpath,sizeof(dirpath),"/proc/%d/task",g_target_pid);
-        DIR* dd = opendir(dirpath);
-        if(dd){
-            struct dirent *xx;
-            while ((xx=readdir(dd))) {
-                if(xx->d_name[0]=='.') continue;
-                pid_t tid = atoi(xx->d_name);
-                if(!tid) continue;
-                fprintf(stderr,"[watchman] attaching TID=%d\n", tid);
-                if(attach_thread(tid)==0){
-                    for(int i=0; i<g_num_watches && i<4; i++){
-                        set_watchpoint(tid,i,g_watches[i].addr,g_watches[i].size);
-                    }
-                    ptrace(PTRACE_CONT,tid,NULL,NULL);
-                }
-            }
-            closedir(dd);
+    // Parse watchpoints
+    num_watchpoints = 0;
+    for (int i = 2; i < argc; i += 2) {
+        if (num_watchpoints >= MAX_WATCHPOINTS) {
+            fprintf(stderr, "[watchman] Maximum number of watchpoints (%d) exceeded\n", MAX_WATCHPOINTS);
+            return 1;
         }
+
+        watchpoints[num_watchpoints].addr = strtoul(argv[i], NULL, 0);
+        watchpoints[num_watchpoints].size = atoi(argv[i + 1]);
+        
+        if (watchpoints[num_watchpoints].size != 1 &&
+            watchpoints[num_watchpoints].size != 2 &&
+            watchpoints[num_watchpoints].size != 4) {
+            fprintf(stderr, "[watchman] Invalid watchpoint size %zu for watchpoint %d. Must be 1, 2, or 4.\n",
+                    watchpoints[num_watchpoints].size, num_watchpoints);
+            return 1;
+        }
+
+        // Check alignment
+        if (watchpoints[num_watchpoints].addr % watchpoints[num_watchpoints].size != 0) {
+            fprintf(stderr, "[watchman] Address 0x%lx is not aligned to %zu bytes for watchpoint %d.\n",
+                    watchpoints[num_watchpoints].addr, watchpoints[num_watchpoints].size, num_watchpoints);
+            return 1;
+        }
+
+        num_watchpoints++;
     }
 
-    // main event loop
-    while(!g_stop_requested){
+    // Print watchpoints
+    fprintf(stderr, "[watchman] Setting %d watchpoint(s):\n", num_watchpoints);
+    for (int i = 0; i < num_watchpoints; i++) {
+        fprintf(stderr, "  Watchpoint %d: addr=0x%lx, size=%zu\n",
+                i, watchpoints[i].addr, watchpoints[i].size);
+    }
+
+    // Attach to all threads
+    if (attach_all_threads(pid) == -1) {
+        fprintf(stderr, "[watchman] Failed to attach to all threads\n");
+        return 1;
+    }
+
+    fprintf(stderr, "[watchman] Starting main event loop...\n");
+
+    // Main event loop
+    while (1) {
         int status;
-        pid_t tid = waitpid(-1,&status,__WALL);
-        if(tid<0){
-            if(errno==EINTR && !g_stop_requested) continue;
+        pid_t tid = waitpid(-1, &status, __WALL);
+        if (tid == -1) {
+            if (errno == EINTR)
+                continue;
+            perror("[watchman] waitpid");
             break;
         }
-        if(WIFSTOPPED(status)){
-            int sig = WSTOPSIG(status);
-            if(sig==SIGTRAP){
-                long dr6 = ptrace(PTRACE_PEEKUSER,tid,(void*)offsetof(struct user,u_debugreg[6]),0);
-                int watch_bits = dr6 & 0xF;
-                int step_bit = dr6 & (1<<14);
-                if(watch_bits){
-                    // clear dr6
-                    ptrace(PTRACE_POKEUSER,tid,(void*)offsetof(struct user,u_debugreg[6]),(void*)0);
-                    // deliver SIGUSR2
-                    ptrace(PTRACE_CONT,tid,NULL,(void*)SIGUSR2);
-                }else if(step_bit){
-                    ptrace(PTRACE_CONT,tid,NULL,0);
-                }else{
-                    ptrace(PTRACE_CONT,tid,NULL,(void*)(long)sig);
-                }
-            } else{
-                // pass signal
-                ptrace(PTRACE_CONT,tid,NULL,(void*)(long)sig);
-            }
-        }else if(WIFEXITED(status)||WIFSIGNALED(status)){
-            if(tid==g_target_pid){
-                fprintf(stderr,"[watchman] Target pid %d exited\n", g_target_pid);
-                break;
-            } else{
-                fprintf(stderr,"[watchman] TID=%d exited\n", tid);
-            }
-        }
+
+        handle_trace_event(tid, status);
     }
 
-    // we do final detach
-    // ignore subsequent ctrl+c
-    ignore_subsequent_ctrl_c();
-
-    fprintf(stderr,"[watchman] shutting down => flush + detach...\n");
-    flush_and_detach_all_threads(g_target_pid, 1);
-    fprintf(stderr,"[watchman] done.\n");
+    fprintf(stderr, "[watchman] Exiting...\n");
     return 0;
 }
